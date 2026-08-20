@@ -371,7 +371,7 @@ function Store({ query, activeCat, setActiveCat, onAdd, images }) {
   return (
     <div style={styles.storeWrap}>
       <div style={styles.hero}>
-        <div style={styles.heroEyebrow}>SOLO DELIVERY · A LA BRASA</div>
+        <div style={styles.heroEyebrow}>SOLO DELIVERY ·SMASH BURGERS & COMBOS</div>
         <h1 style={styles.heroTitle}>PEDÍ TU BURGER FAVORITA</h1>
       </div>
 
