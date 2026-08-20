@@ -25,7 +25,7 @@ const FONTS_CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
 `;
 
-const MENU = [
+const SEED_MENU = [
   {
     cat: "Burgers",
     icon: "🍔",
@@ -56,6 +56,33 @@ const MENU = [
     ],
   },
 ];
+
+const CATEGORY_ICONS = { Burgers: "🍔", Acompañamientos: "🍟", Bebidas: "🥤", Combos: "🎁" };
+function categoryIcon(cat) {
+  return CATEGORY_ICONS[cat] || "🍽️";
+}
+function buildSeedItems() {
+  const rows = [];
+  let order = 0;
+  SEED_MENU.forEach((section) => {
+    section.items.forEach((it) => {
+      rows.push({
+        id: it.id, category: section.cat, name: it.name,
+        description: it.desc || "", price: it.price, image_url: null, sort_order: order++,
+      });
+    });
+  });
+  return rows;
+}
+function groupItems(items) {
+  const order = [];
+  const map = {};
+  items.forEach((it) => {
+    if (!map[it.category]) { map[it.category] = []; order.push(it.category); }
+    map[it.category].push(it);
+  });
+  return order.map((cat) => ({ cat, icon: categoryIcon(cat), items: map[cat] }));
+}
 
 const WHATSAPP = "5491137994287";
 const ALIAS = "valdzburger";
@@ -171,30 +198,48 @@ async function updateOrderStatus(id, status) {
   await saveOrders(list.map((o) => (o.id === id ? { ...o, status } : o)));
 }
 
-async function getMenuImages() {
+async function getMenuItems() {
   if (hasSupabase) {
-    const { data, error } = await supabase.from("menu_images").select("*");
-    if (error) { console.error(error); return {}; }
-    const map = {};
-    data.forEach((r) => { map[r.item_id] = r.url; });
-    return map;
-  }
-  const v = await storageGet("menu-images", true);
-  try { return v ? JSON.parse(v) : {}; } catch { return {}; }
-}
-async function saveMenuImages(map) {
-  if (hasSupabase) {
-    const rows = Object.entries(map).map(([item_id, url]) => ({ item_id, url }));
-    if (rows.length) {
-      const { error } = await supabase.from("menu_images").upsert(rows);
-      if (error) console.error(error);
+    let { data, error } = await supabase.from("menu_items").select("*").order("sort_order", { ascending: true });
+    if (error) { console.error(error); return buildSeedItems(); }
+    if (!data || data.length === 0) {
+      const seed = buildSeedItems();
+      await supabase.from("menu_items").insert(seed);
+      const res = await supabase.from("menu_items").select("*").order("sort_order", { ascending: true });
+      data = res.data;
     }
-    const { data } = await supabase.from("menu_images").select("item_id");
-    const toDelete = (data || []).map((d) => d.item_id).filter((id) => !(id in map));
-    if (toDelete.length) await supabase.from("menu_images").delete().in("item_id", toDelete);
+    return data || buildSeedItems();
+  }
+  const v = await storageGet("menu-items", true);
+  try {
+    const parsed = v ? JSON.parse(v) : null;
+    return parsed && parsed.length ? parsed : buildSeedItems();
+  } catch {
+    return buildSeedItems();
+  }
+}
+async function saveLocalMenuItems(list) {
+  await storageSet("menu-items", JSON.stringify(list), true);
+}
+async function upsertMenuItem(item) {
+  if (hasSupabase) {
+    const { error } = await supabase.from("menu_items").upsert(item);
+    if (error) console.error(error);
     return;
   }
-  await storageSet("menu-images", JSON.stringify(map), true);
+  const list = await getMenuItems();
+  const idx = list.findIndex((x) => x.id === item.id);
+  if (idx >= 0) list[idx] = item; else list.push(item);
+  await saveLocalMenuItems(list);
+}
+async function deleteMenuItemRow(id) {
+  if (hasSupabase) {
+    const { error } = await supabase.from("menu_items").delete().eq("id", id);
+    if (error) console.error(error);
+    return;
+  }
+  const list = await getMenuItems();
+  await saveLocalMenuItems(list.filter((x) => x.id !== id));
 }
 
 async function getProfile() {
@@ -215,11 +260,20 @@ export default function ValdezBurger() {
   const [lastOrder, setLastOrder] = useState(null);
   const [toast, setToast] = useState("");
   const [query, setQuery] = useState("");
-  const [activeCat, setActiveCat] = useState(MENU[0].cat);
-  const [images, setImages] = useState({});
+  const [items, setItems] = useState([]);
+  const [activeCat, setActiveCat] = useState(null);
+
+  const reloadItems = useCallback(() => {
+    getMenuItems().then((list) => {
+      setItems(list);
+      setActiveCat((prev) => (prev && list.some((it) => it.category === prev)) ? prev : (list[0]?.category || null));
+    });
+  }, []);
 
   useEffect(() => { getProfile().then(setProfile); }, []);
-  useEffect(() => { getMenuImages().then(setImages); }, []);
+  useEffect(() => { reloadItems(); }, [reloadItems]);
+
+  const sections = useMemo(() => groupItems(items), [items]);
 
   const flashToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 1600); };
 
@@ -235,8 +289,7 @@ export default function ValdezBurger() {
     setCart((c) => c.map((x) => (x.id === id ? { ...x, qty: x.qty + delta } : x)).filter((x) => x.qty > 0));
   };
 
-  const allItems = MENU.flatMap((c) => c.items);
-  const cartLines = cart.map((c) => ({ ...c, item: allItems.find((i) => i.id === c.id) })).filter((l) => l.item);
+  const cartLines = cart.map((c) => ({ ...c, item: items.find((i) => i.id === c.id) })).filter((l) => l.item);
   const total = cartLines.reduce((s, l) => s + l.item.price * l.qty, 0);
   const cartCount = cart.reduce((s, c) => s + c.qty, 0);
 
@@ -251,10 +304,10 @@ export default function ValdezBurger() {
       {view === "store" && (
         <Store
           query={query}
+          sections={sections}
           activeCat={activeCat}
           setActiveCat={setActiveCat}
           onAdd={addToCart}
-          images={images}
         />
       )}
 
@@ -306,7 +359,7 @@ export default function ValdezBurger() {
       {(view === "store") && (
         <div style={{ display: "flex", justifyContent: "center", gap: 14 }}>
           <button style={styles.kitchenLink} onClick={() => setView("kitchen-login")}>Acceso cocina</button>
-          <button style={styles.kitchenLink} onClick={() => setView("admin-login")}>Editar fotos</button>
+          <button style={styles.kitchenLink} onClick={() => setView("admin-login")}>Editar menú</button>
         </div>
       )}
       {view === "kitchen-login" && <KitchenLogin onOk={() => setView("kitchen")} onBack={() => setView("store")} />}
@@ -315,13 +368,11 @@ export default function ValdezBurger() {
         <AdminLogin onOk={() => setView("admin")} onBack={() => setView("store")} />
       )}
       {view === "admin" && (
-        <AdminPhotos
-          images={images}
-          onSave={async (map) => {
-            setImages(map);
-            await saveMenuImages(map);
+        <AdminMenu
+          onExit={() => {
+            reloadItems();
+            setView("store");
           }}
-          onExit={() => setView("store")}
         />
       )}
 
@@ -357,27 +408,29 @@ function TopBar({ query, setQuery, cartCount, onCart }) {
 }
 
 /* ---------------------------- STORE ---------------------------- */
-function Store({ query, activeCat, setActiveCat, onAdd, images }) {
+function Store({ query, sections, activeCat, setActiveCat, onAdd }) {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return MENU.map((section) => ({
+    return sections.map((section) => ({
       ...section,
       items: section.items.filter(
-        (it) => !q || it.name.toLowerCase().includes(q) || it.desc.toLowerCase().includes(q)
+        (it) => !q || it.name.toLowerCase().includes(q) || (it.description || "").toLowerCase().includes(q)
       ),
     })).filter((section) => section.items.length > 0);
-  }, [query]);
+  }, [query, sections]);
 
   return (
     <div style={styles.storeWrap}>
       <div style={styles.hero}>
-        <div style={styles.heroEyebrow}>SOLO DELIVERY ·SMASH BURGERS & COMBOS</div>
+        <div style={styles.heroEyebrow}>SMASH BURGERS & COMBOS</div>
         <h1 style={styles.heroTitle}>PEDÍ TU BURGER FAVORITA</h1>
       </div>
 
-      {!query && (
+      {sections.length === 0 && <p style={styles.emptyText}>Cargando menú…</p>}
+
+      {!query && sections.length > 0 && (
         <div style={styles.tabsRow}>
-          {MENU.map((s) => (
+          {sections.map((s) => (
             <button
               key={s.cat}
               style={{ ...styles.tab, ...(activeCat === s.cat ? styles.tabActive : {}) }}
@@ -400,15 +453,15 @@ function Store({ query, activeCat, setActiveCat, onAdd, images }) {
                   <div
                     style={{
                       ...styles.cardImg,
-                      background: images[item.id] ? `center/cover no-repeat url(${images[item.id]})` : imgGradient(section.cat),
+                      background: item.image_url ? `center/cover no-repeat url(${item.image_url})` : imgGradient(section.cat),
                     }}
                   >
-                    {!images[item.id] && <span style={styles.cardEmoji}>{section.icon}</span>}
+                    {!item.image_url && <span style={styles.cardEmoji}>{section.icon}</span>}
                     <button style={styles.cardAddFab} onClick={() => onAdd(item)}>+</button>
                   </div>
                   <div style={styles.cardBody}>
                     <h3 style={styles.cardName}>{item.name}</h3>
-                    {item.desc && <p style={styles.cardDesc}>{item.desc}</p>}
+                    {item.description && <p style={styles.cardDesc}>{item.description}</p>}
                     <span style={styles.cardPrice}>{money(item.price)}</span>
                   </div>
                 </div>
@@ -417,7 +470,7 @@ function Store({ query, activeCat, setActiveCat, onAdd, images }) {
           </div>
         ))}
 
-      {filtered.every((s) => s.items.length === 0) && (
+      {sections.length > 0 && filtered.every((s) => s.items.length === 0) && (
         <p style={styles.emptyText}>No encontramos nada con “{query}”.</p>
       )}
     </div>
@@ -595,45 +648,91 @@ function AdminLogin({ onOk, onBack }) {
   );
 }
 
-function AdminPhotos({ images, onSave, onExit }) {
-  const [draft, setDraft] = useState(images);
-  const [savedFlash, setSavedFlash] = useState(false);
-  const allItems = MENU.flatMap((s) => s.items.map((it) => ({ ...it, cat: s.cat })));
+function AdminMenu({ onExit }) {
+  const [rows, setRows] = useState(null);
+  const [savedId, setSavedId] = useState(null);
+  const [draftNew, setDraftNew] = useState({ category: "", name: "", description: "", price: "", image_url: "" });
+  const [addingFlash, setAddingFlash] = useState(false);
 
-  const setUrl = (id, url) => setDraft((d) => ({ ...d, [id]: url }));
+  const reload = () => getMenuItems().then(setRows);
+  useEffect(() => { reload(); }, []);
 
-  const save = async () => {
-    const clean = Object.fromEntries(Object.entries(draft).filter(([, v]) => v && v.trim()));
-    await onSave(clean);
-    setSavedFlash(true);
-    setTimeout(() => setSavedFlash(false), 1500);
+  const updateRow = (id, field, value) => {
+    setRows((list) => list.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
   };
+
+  const saveRow = async (row) => {
+    await upsertMenuItem({ ...row, price: Number(row.price) || 0 });
+    setSavedId(row.id);
+    setTimeout(() => setSavedId(null), 1200);
+  };
+
+  const removeRow = async (id) => {
+    await deleteMenuItemRow(id);
+    setRows((list) => list.filter((r) => r.id !== id));
+  };
+
+  const addNew = async () => {
+    if (!draftNew.category.trim() || !draftNew.name.trim() || !draftNew.price) return;
+    const maxOrder = rows && rows.length ? Math.max(...rows.map((r) => r.sort_order || 0)) : 0;
+    const item = {
+      id: uid(),
+      category: draftNew.category.trim(),
+      name: draftNew.name.trim(),
+      description: draftNew.description.trim(),
+      price: Number(draftNew.price) || 0,
+      image_url: draftNew.image_url.trim() || null,
+      sort_order: maxOrder + 1,
+    };
+    await upsertMenuItem(item);
+    setRows((list) => [...(list || []), item]);
+    setDraftNew({ category: draftNew.category, name: "", description: "", price: "", image_url: "" });
+    setAddingFlash(true);
+    setTimeout(() => setAddingFlash(false), 1200);
+  };
+
+  const grouped = rows ? groupItems(rows) : [];
 
   return (
     <div style={styles.panelWrap}>
       <button style={styles.backLink} onClick={onExit}>‹ Volver a la tienda</button>
+
       <div style={styles.card2}>
-        <h2 style={styles.panelHeading}>Fotos de los productos</h2>
-        <p style={styles.emptyText}>
-          Pegá el link de una foto para cada producto (subila antes a algún servicio como Google
-          Drive, Imgur o similar, en modo público, y copiá el link directo de la imagen). Dejá el
-          campo vacío para usar el ícono de color.
-        </p>
-        {allItems.map((item) => (
-          <div key={item.id} style={{ marginBottom: 14 }}>
-            <div style={styles.fieldLabel}>{item.name}</div>
-            <input
-              style={styles.input}
-              placeholder="https://…"
-              value={draft[item.id] || ""}
-              onChange={(e) => setUrl(item.id, e.target.value)}
-            />
-          </div>
-        ))}
-        <button style={styles.primaryBtn} onClick={save}>
-          {savedFlash ? "Guardado ✓" : "Guardar fotos"}
+        <h2 style={styles.panelHeading}>Agregar producto o combo</h2>
+        <Field label="Categoría (Burgers, Combos, Bebidas...)" value={draftNew.category} onChange={(v) => setDraftNew((d) => ({ ...d, category: v }))} placeholder="Ej: Combos" />
+        <Field label="Nombre" value={draftNew.name} onChange={(v) => setDraftNew((d) => ({ ...d, name: v }))} placeholder="Ej: Combo Doble Brasa" />
+        <Field label="Descripción" value={draftNew.description} onChange={(v) => setDraftNew((d) => ({ ...d, description: v }))} placeholder="Ej: burger + papas + bebida" />
+        <Field label="Precio" value={draftNew.price} onChange={(v) => setDraftNew((d) => ({ ...d, price: v.replace(/[^0-9]/g, "") }))} placeholder="Ej: 9500" />
+        <Field label="Foto (link, opcional)" value={draftNew.image_url} onChange={(v) => setDraftNew((d) => ({ ...d, image_url: v }))} placeholder="https://…" />
+        <button style={styles.primaryBtn} onClick={addNew}>
+          {addingFlash ? "Agregado ✓" : "+ Agregar al menú"}
         </button>
       </div>
+
+      {!rows && <p style={{ ...styles.emptyText, marginTop: 16 }}>Cargando…</p>}
+
+      {grouped.map((section) => (
+        <div key={section.cat} style={{ ...styles.card2, marginTop: 16 }}>
+          <h2 style={styles.panelHeading}>{section.icon} {section.cat}</h2>
+          {section.items.map((row) => (
+            <div key={row.id} style={{ marginBottom: 18, paddingBottom: 14, borderBottom: `1px solid ${BG}` }}>
+              <Field label="Nombre" value={row.name} onChange={(v) => updateRow(row.id, "name", v)} />
+              <Field label="Descripción" value={row.description || ""} onChange={(v) => updateRow(row.id, "description", v)} />
+              <Field label="Precio" value={String(row.price)} onChange={(v) => updateRow(row.id, "price", v.replace(/[^0-9]/g, ""))} />
+              <Field label="Categoría" value={row.category} onChange={(v) => updateRow(row.id, "category", v)} />
+              <Field label="Foto (link)" value={row.image_url || ""} onChange={(v) => updateRow(row.id, "image_url", v)} placeholder="https://…" />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button style={styles.printBtn} onClick={() => saveRow(row)}>
+                  {savedId === row.id ? "Guardado ✓" : "Guardar cambios"}
+                </button>
+                <button style={{ ...styles.printBtn, color: BRASA, borderColor: BRASA }} onClick={() => removeRow(row.id)}>
+                  Eliminar
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ))}
     </div>
   );
 }
