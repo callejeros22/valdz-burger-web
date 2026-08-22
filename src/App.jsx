@@ -88,10 +88,6 @@ const WHATSAPP = "5491137994287";
 const ALIAS = "valdzburger";
 const KITCHEN_PASS = "valdez2026";
 const ADMIN_PASS = "valdezfotos2026";
-// Pegá acá el link directo a tu logo (subido a postimg o similar) para que
-// salga impreso arriba del ticket de cocina/factura. Dejalo vacío ("") si
-// todavía no tenés uno — el ticket funciona igual, sin logo.
-const LOGO_URL = "";
 
 function money(n) {
   return n.toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -165,16 +161,9 @@ async function storageSet(key, value, shared) {
 
 function rowToOrder(row) {
   return {
-    id: row.id, items: row.items, total: row.total, customer: row.customer, status: row.status,
-    createdAt: row.created_at, orderNumber: row.order_number || null,
-    timestamps: row.timestamps || { Nuevo: row.created_at, "En preparación": null, Listo: null, Entregado: null },
+    id: row.id, items: row.items, total: row.total, customer: row.customer, status: row.status, createdAt: row.created_at,
+    courierLat: row.courier_lat ?? null, courierLng: row.courier_lng ?? null, courierUpdatedAt: row.courier_updated_at ?? null,
   };
-}
-
-async function getNextOrderNumber() {
-  const list = await getOrders();
-  const numbers = list.map((o) => o.orderNumber || 0).filter((n) => typeof n === "number");
-  return (numbers.length ? Math.max(...numbers) : 0) + 1;
 }
 
 async function getOrders() {
@@ -195,7 +184,6 @@ async function insertOrder(order) {
     const { error } = await supabase.from("orders").insert({
       id: order.id, items: order.items, total: order.total,
       customer: order.customer, status: order.status, created_at: order.createdAt,
-      order_number: order.orderNumber, timestamps: order.timestamps,
     });
     if (error) console.error(error);
     return;
@@ -203,14 +191,49 @@ async function insertOrder(order) {
   const list = await getOrders();
   await saveOrders([order, ...list]);
 }
-async function updateOrderStatus(id, status, timestamps) {
+async function updateOrderStatus(id, status) {
   if (hasSupabase) {
-    const { error } = await supabase.from("orders").update({ status, timestamps }).eq("id", id);
+    const { error } = await supabase.from("orders").update({ status }).eq("id", id);
     if (error) console.error(error);
     return;
   }
   const list = await getOrders();
-  await saveOrders(list.map((o) => (o.id === id ? { ...o, status, timestamps } : o)));
+  await saveOrders(list.map((o) => (o.id === id ? { ...o, status } : o)));
+}
+
+async function getOrderById(id) {
+  if (hasSupabase) {
+    const { data, error } = await supabase.from("orders").select("*").eq("id", id).single();
+    if (error) { console.error(error); return null; }
+    return rowToOrder(data);
+  }
+  const list = await getOrders();
+  return list.find((o) => o.id === id) || null;
+}
+
+async function updateCourierLocation(id, lat, lng) {
+  if (!hasSupabase) return; // el seguimiento en vivo necesita base de datos compartida
+  const { error } = await supabase
+    .from("orders")
+    .update({ courier_lat: lat, courier_lng: lng, courier_updated_at: new Date().toISOString() })
+    .eq("id", id);
+  if (error) console.error(error);
+}
+
+// Convierte una dirección de texto en coordenadas usando Nominatim (OpenStreetMap),
+// gratis y sin API key — service público con límite de uso razonable, ideal para
+// un local que geolocaliza una dirección por pedido.
+async function geocodeAddress(address) {
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=ar&q=${encodeURIComponent(address)}`
+    );
+    const data = await res.json();
+    if (data && data[0]) return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+  } catch (e) {
+    console.error(e);
+  }
+  return null;
 }
 
 async function getMenuItems() {
@@ -265,11 +288,23 @@ async function saveProfile(p) {
   await storageSet("my-profile", JSON.stringify(p), false);
 }
 
-const STATUS_FLOW = ["Nuevo", "En preparación", "Listo", "Entregado"];
-const STATUS_COLOR = { Nuevo: "#E8541F", "En preparación": "#D6A233", Listo: "#4C9A6A", Entregado: "#8A8073" };
+const STATUS_FLOW = ["Nuevo", "En preparación", "Listo", "En camino", "Entregado"];
+const STATUS_COLOR = { Nuevo: "#E8541F", "En preparación": "#D6A233", Listo: "#4C9A6A", "En camino": "#3E7CB1", Entregado: "#8A8073" };
+
+function getUrlParams() {
+  if (typeof window === "undefined") return {};
+  const p = new URLSearchParams(window.location.search);
+  return { courier: p.get("courier"), pedido: p.get("pedido") };
+}
 
 export default function ValdezBurger() {
-  const [view, setView] = useState("store");
+  const urlParams = useMemo(() => getUrlParams(), []);
+  const [view, setView] = useState(() => {
+    if (urlParams.courier) return "courier-share";
+    if (urlParams.pedido) return "track";
+    return "store";
+  });
+  const [trackingId, setTrackingId] = useState(urlParams.pedido || null);
   const [cart, setCart] = useState([]);
   const [profile, setProfile] = useState(null);
   const [lastOrder, setLastOrder] = useState(null);
@@ -351,17 +386,13 @@ export default function ValdezBurger() {
           profile={profile}
           onBack={() => setView("cart")}
           onConfirm={async (custom) => {
-            const now = new Date().toISOString();
-            const orderNumber = await getNextOrderNumber();
             const order = {
               id: uid().toUpperCase(),
-              orderNumber,
               items: cartLines.map((l) => ({ name: l.item.name, price: l.item.price, qty: l.qty })),
               total,
               customer: custom,
               status: "Nuevo",
-              createdAt: now,
-              timestamps: { Nuevo: now, "En preparación": null, Listo: null, Entregado: null },
+              createdAt: new Date().toISOString(),
             };
             await insertOrder(order);
             await saveProfile(custom);
@@ -373,7 +404,24 @@ export default function ValdezBurger() {
         />
       )}
 
-      {view === "confirm" && lastOrder && <Confirmation order={lastOrder} onNew={() => setView("store")} />}
+      {view === "confirm" && lastOrder && (
+        <Confirmation
+          order={lastOrder}
+          onNew={() => setView("store")}
+          onTrack={() => {
+            setTrackingId(lastOrder.id);
+            setView("track");
+          }}
+        />
+      )}
+
+      {view === "track" && trackingId && (
+        <TrackOrder orderId={trackingId} onExit={() => setView("store")} />
+      )}
+
+      {view === "courier-share" && urlParams.courier && (
+        <CourierShare orderId={urlParams.courier} />
+      )}
 
       {(view === "store") && (
         <div style={{ display: "flex", justifyContent: "center", gap: 14 }}>
@@ -472,7 +520,7 @@ function Store({ query, sections, activeCat, setActiveCat, onAdd }) {
                   <div
                     style={{
                       ...styles.cardImg,
-                      background: item.image_url ? `center/contain no-repeat url(${item.image_url})` : imgGradient(section.cat),
+                      background: item.image_url ? `center/cover no-repeat url(${item.image_url})` : imgGradient(section.cat),
                     }}
                   >
                     {!item.image_url && <span style={styles.cardEmoji}>{section.icon}</span>}
@@ -594,61 +642,16 @@ function Field({ label, value, onChange, placeholder }) {
 }
 
 /* ---------------------------- CONFIRMATION ---------------------------- */
-const STATUS_EMOJI = { Nuevo: "✅", "En preparación": "🍳", Listo: "📦", Entregado: "🏠" };
-
-function Confirmation({ order, onNew }) {
-  const [live, setLive] = useState(order);
+function Confirmation({ order, onNew, onTrack }) {
   const waMsg = encodeURIComponent(
-    `Hola! Soy ${order.customer.name}, hice el pedido #${order.orderNumber || order.id} (${money(order.total)}, ${order.customer.payment}). Dirección: ${order.customer.address}`
+    `Hola! Soy ${order.customer.name}, hice el pedido #${order.id} (${money(order.total)}, ${order.customer.payment}). Dirección: ${order.customer.address}`
   );
-
-  useEffect(() => {
-    const t = setInterval(async () => {
-      const list = await getOrders();
-      const fresh = list.find((o) => o.id === order.id);
-      if (fresh) setLive(fresh);
-    }, 5000);
-    return () => clearInterval(t);
-  }, [order.id]);
-
   return (
     <div style={styles.panelWrap}>
       <div style={styles.card2}>
         <div style={styles.confirmBadge}>✓</div>
-        <h2 style={styles.panelHeading}>Pedido #{live.orderNumber || live.id}</h2>
-        <p style={styles.emptyText}>Lo estamos preparando — acá abajo vas a ver el estado en vivo.</p>
-
-        <div style={{ margin: "16px 0" }}>
-          {STATUS_FLOW.map((status, idx) => {
-            const reached = idx <= STATUS_FLOW.indexOf(live.status);
-            return (
-              <div key={status}>
-                <div style={{ display: "flex", alignItems: "center", gap: 12, opacity: reached ? 1 : 0.4 }}>
-                  <div style={{
-                    width: 36, height: 36, borderRadius: "50%",
-                    background: reached ? STATUS_COLOR[status] : "#E0D5C7",
-                    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16,
-                  }}>
-                    {STATUS_EMOJI[status]}
-                  </div>
-                  <div>
-                    <div style={{ fontWeight: 600, fontSize: 13.5 }}>{status}</div>
-                    {live.timestamps && live.timestamps[status] && (
-                      <div style={{ fontSize: 11.5, color: HUMO }}>
-                        {new Date(live.timestamps[status]).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-                {idx < STATUS_FLOW.length - 1 && (
-                  <div style={{ marginLeft: 17, height: 20, borderLeft: "2px solid #E0D5C7" }} />
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        <div style={styles.divider} />
+        <h2 style={styles.panelHeading}>¡Pedido enviado a cocina!</h2>
+        <p style={styles.emptyText}>Pedido #{order.id} — lo estamos preparando.</p>
         {order.items.map((it, i) => (
           <div key={i} style={styles.lineRow}>
             <div style={styles.lineName}>{it.qty}× {it.name}</div>
@@ -661,6 +664,7 @@ function Confirmation({ order, onNew }) {
       <a style={styles.primaryBtn} href={`https://wa.me/${WHATSAPP}?text=${waMsg}`} target="_blank" rel="noreferrer">
         Enviar comprobante por WhatsApp
       </a>
+      <button style={{ ...styles.primaryBtn, background: TINTA }} onClick={onTrack}>Seguir mi pedido en vivo</button>
       <button style={styles.secondaryBtn} onClick={onNew}>Hacer otro pedido</button>
     </div>
   );
@@ -835,9 +839,8 @@ function Kitchen({ onExit }) {
     if (!current) return;
     const idx = STATUS_FLOW.indexOf(current.status);
     const nextStatus = STATUS_FLOW[Math.min(idx + 1, STATUS_FLOW.length - 1)];
-    const timestamps = { ...current.timestamps, [nextStatus]: new Date().toISOString() };
-    await updateOrderStatus(id, nextStatus, timestamps);
-    setOrders((list) => list.map((o) => (o.id === id ? { ...o, status: nextStatus, timestamps } : o)));
+    await updateOrderStatus(id, nextStatus);
+    setOrders((list) => list.map((o) => (o.id === id ? { ...o, status: nextStatus } : o)));
   };
 
   const active = orders.filter((o) => o.status !== "Entregado");
@@ -863,7 +866,7 @@ function Kitchen({ onExit }) {
         {active.map((o) => (
           <div key={o.id} style={styles.ticket}>
             <div style={styles.ticketHeaderRow}>
-              <span>Pedido #{o.orderNumber || o.id}</span>
+              <span>#{o.id}</span>
               <span>{new Date(o.createdAt).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" })}</span>
             </div>
             <div style={styles.ticketDivider} />
@@ -885,6 +888,18 @@ function Kitchen({ onExit }) {
               <button style={styles.printBtn} onClick={() => setPrintJob({ order: o, type: "cocina" })}>🖨 Comanda</button>
               <button style={styles.printBtn} onClick={() => setPrintJob({ order: o, type: "factura" })}>🖨 Factura</button>
             </div>
+            {(o.status === "Listo" || o.status === "En camino") && (
+              <button
+                style={{ ...styles.printBtn, width: "100%", marginTop: 8 }}
+                onClick={() => {
+                  const link = `${window.location.origin}${window.location.pathname}?courier=${o.id}`;
+                  navigator.clipboard?.writeText(link);
+                  alert("Link copiado — mandaselo al repartidor por WhatsApp:\n" + link);
+                }}
+              >
+                📍 Copiar link para el repartidor
+              </button>
+            )}
           </div>
         ))}
       </div>
@@ -909,17 +924,12 @@ function PrintArea({ order, type }) {
   return (
     <div id="print-area">
       <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, width: 280 }}>
-        {LOGO_URL && (
-          <div style={{ textAlign: "center", marginBottom: 10 }}>
-            <img src={LOGO_URL} alt="VALD'Z BURGER" style={{ maxWidth: "100%", height: "auto", maxHeight: 80 }} />
-          </div>
-        )}
         <div style={{ textAlign: "center", fontWeight: 700 }}>VALD'Z BURGER</div>
         <div style={{ textAlign: "center", fontSize: 11 }}>
           {type === "cocina" ? "COMANDA DE COCINA" : "FACTURA / COMPROBANTE"}
         </div>
         <div style={{ borderTop: "1px dashed #000", margin: "6px 0" }} />
-        <div>Pedido #{order.orderNumber || order.id}</div>
+        <div>Pedido #{order.id}</div>
         <div>{new Date(order.createdAt).toLocaleString("es-AR")}</div>
         <div style={{ borderTop: "1px dashed #000", margin: "6px 0" }} />
         {order.items.map((it, i) => (
@@ -942,6 +952,266 @@ function PrintArea({ order, type }) {
         <div>Tel: {order.customer.phone}</div>
         <div>Dirección: {order.customer.address}</div>
         {order.customer.notes && <div>Nota: {order.customer.notes}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------- MAPA EN VIVO ---------------------------- */
+function CourierMapView({ lat, lng }) {
+  const mapDivRef = useRef(null);
+  const mapObjRef = useRef(null);
+  const markerRef = useRef(null);
+  const [ready, setReady] = useState(!!window.L);
+
+  useEffect(() => {
+    if (window.L) { setReady(true); return; }
+    const t = setInterval(() => { if (window.L) { setReady(true); clearInterval(t); } }, 300);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    if (!ready || !mapDivRef.current || lat == null || lng == null) return;
+    if (!mapObjRef.current) {
+      mapObjRef.current = window.L.map(mapDivRef.current).setView([lat, lng], 15);
+      window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "&copy; OpenStreetMap",
+        maxZoom: 19,
+      }).addTo(mapObjRef.current);
+      markerRef.current = window.L.marker([lat, lng]).addTo(mapObjRef.current).bindPopup("Repartidor");
+    } else {
+      markerRef.current.setLatLng([lat, lng]);
+      mapObjRef.current.setView([lat, lng]);
+    }
+  }, [ready, lat, lng]);
+
+  if (!ready) return <p style={styles.emptyText}>Cargando mapa…</p>;
+  if (lat == null || lng == null) return <p style={styles.emptyText}>Todavía no hay ubicación del repartidor.</p>;
+  return <div ref={mapDivRef} style={{ height: 260, borderRadius: 12, overflow: "hidden", border: `1px solid ${BORDER}` }} />;
+}
+
+/* ---------------------------- SEGUIMIENTO (CLIENTE) ---------------------------- */
+function TrackOrder({ orderId, onExit }) {
+  const [order, setOrder] = useState(null);
+  const [notFound, setNotFound] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const o = await getOrderById(orderId);
+    if (!o) { setNotFound(true); return; }
+    setOrder(o);
+  }, [orderId]);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 5000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  if (notFound) {
+    return (
+      <div style={styles.panelWrap}>
+        <button style={styles.backLink} onClick={onExit}>‹ Volver a la tienda</button>
+        <p style={styles.emptyText}>No encontramos ese pedido.</p>
+      </div>
+    );
+  }
+  if (!order) {
+    return (
+      <div style={styles.panelWrap}>
+        <p style={styles.emptyText}>Cargando pedido…</p>
+      </div>
+    );
+  }
+
+  const idx = STATUS_FLOW.indexOf(order.status);
+
+  return (
+    <div style={styles.panelWrap}>
+      <button style={styles.backLink} onClick={onExit}>‹ Volver a la tienda</button>
+      <div style={styles.card2}>
+        <h2 style={styles.panelHeading}>Pedido #{order.id}</h2>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
+          {STATUS_FLOW.map((s, i) => (
+            <span
+              key={s}
+              style={{
+                fontSize: 11.5, fontWeight: 700, padding: "6px 10px", borderRadius: 20,
+                background: i <= idx ? STATUS_COLOR[s] : BG,
+                color: i <= idx ? "#fff" : HUMO,
+              }}
+            >
+              {s}
+            </span>
+          ))}
+        </div>
+
+        {order.status === "En camino" && (
+          <div style={{ marginBottom: 14 }}>
+            <CourierMapView lat={order.courierLat} lng={order.courierLng} />
+          </div>
+        )}
+
+        {order.items.map((it, i) => (
+          <div key={i} style={styles.lineRow}>
+            <div style={styles.lineName}>{it.qty}× {it.name}</div>
+            <span style={styles.linePrice}>{money(it.price * it.qty)}</span>
+          </div>
+        ))}
+        <div style={styles.divider} />
+        <div style={styles.totalRow}><span>Total</span><span>{money(order.total)}</span></div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------- VISTA DEL REPARTIDOR ---------------------------- */
+function CourierNavMap({ destLat, destLng, lat, lng }) {
+  const mapDivRef = useRef(null);
+  const mapObjRef = useRef(null);
+  const destMarkerRef = useRef(null);
+  const meMarkerRef = useRef(null);
+  const [ready, setReady] = useState(!!window.L);
+
+  useEffect(() => {
+    if (window.L) { setReady(true); return; }
+    const t = setInterval(() => { if (window.L) { setReady(true); clearInterval(t); } }, 300);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    if (!ready || !mapDivRef.current) return;
+    if (!mapObjRef.current) {
+      const center = destLat != null ? [destLat, destLng] : lat != null ? [lat, lng] : [-34.6, -58.4];
+      mapObjRef.current = window.L.map(mapDivRef.current).setView(center, 14);
+      window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "&copy; OpenStreetMap",
+        maxZoom: 19,
+      }).addTo(mapObjRef.current);
+    }
+    if (destLat != null && destLng != null) {
+      if (!destMarkerRef.current) {
+        destMarkerRef.current = window.L.marker([destLat, destLng]).addTo(mapObjRef.current).bindPopup("Dirección de entrega");
+      } else {
+        destMarkerRef.current.setLatLng([destLat, destLng]);
+      }
+    }
+    if (lat != null && lng != null) {
+      if (!meMarkerRef.current) {
+        meMarkerRef.current = window.L.circleMarker([lat, lng], { radius: 8, color: "#3E7CB1", fillColor: "#3E7CB1", fillOpacity: 0.9 })
+          .addTo(mapObjRef.current)
+          .bindPopup("Vos");
+      } else {
+        meMarkerRef.current.setLatLng([lat, lng]);
+      }
+    }
+    if (destLat != null && lat != null) {
+      mapObjRef.current.fitBounds(window.L.latLngBounds([[destLat, destLng], [lat, lng]]), { padding: [30, 30] });
+    }
+  }, [ready, destLat, destLng, lat, lng]);
+
+  if (!ready) return <p style={styles.emptyText}>Cargando mapa…</p>;
+  return <div ref={mapDivRef} style={{ height: 280, borderRadius: 12, overflow: "hidden", border: `1px solid ${BORDER}` }} />;
+}
+
+function CourierShare({ orderId }) {
+  const [order, setOrder] = useState(null);
+  const [dest, setDest] = useState(null); // { lat, lng } de la dirección de entrega
+  const [geoStatus, setGeoStatus] = useState("loading"); // loading | ok | failed
+  const [sharing, setSharing] = useState(false);
+  const [errMsg, setErrMsg] = useState("");
+  const [lastCoords, setLastCoords] = useState(null);
+  const watchIdRef = useRef(null);
+  const lastSentRef = useRef(0);
+
+  useEffect(() => {
+    getOrderById(orderId).then((o) => {
+      setOrder(o);
+      if (o) {
+        geocodeAddress(o.customer.address).then((coords) => {
+          if (coords) { setDest(coords); setGeoStatus("ok"); }
+          else setGeoStatus("failed");
+        });
+      }
+    });
+  }, [orderId]);
+
+  const startSharing = () => {
+    if (!navigator.geolocation) {
+      setErrMsg("Este navegador no soporta geolocalización.");
+      return;
+    }
+    setErrMsg("");
+    setSharing(true);
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const { latitude, longitude } = pos.coords;
+        setLastCoords({ lat: latitude, lng: longitude });
+        const now = Date.now();
+        if (now - lastSentRef.current > 6000) {
+          lastSentRef.current = now;
+          updateCourierLocation(orderId, latitude, longitude);
+        }
+      },
+      (err) => setErrMsg("No pudimos acceder a tu ubicación: " + err.message),
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+  };
+
+  const stopSharing = () => {
+    if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
+    watchIdRef.current = null;
+    setSharing(false);
+  };
+
+  useEffect(() => () => { if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current); }, []);
+
+  const gmapsUrl = order
+    ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(order.customer.address)}`
+    : null;
+
+  return (
+    <div style={styles.panelWrap}>
+      <div style={styles.card2}>
+        <h2 style={styles.panelHeading}>Reparto — Pedido #{orderId}</h2>
+        {!order && <p style={styles.emptyText}>Cargando datos del pedido…</p>}
+        {order && (
+          <div style={{ fontSize: 13, marginBottom: 14, lineHeight: 1.6 }}>
+            <div><b>{order.customer.name}</b> · {order.customer.phone}</div>
+            <div>{order.customer.address}</div>
+            {order.customer.notes && <div>Nota: {order.customer.notes}</div>}
+          </div>
+        )}
+
+        {order && (
+          <div style={{ marginBottom: 14 }}>
+            {geoStatus === "loading" && <p style={styles.emptyText}>Ubicando la dirección de entrega…</p>}
+            {geoStatus === "failed" && (
+              <p style={styles.emptyText}>No pudimos ubicar la dirección automáticamente en el mapa, pero podés usar el botón de abajo para navegar igual.</p>
+            )}
+            <CourierNavMap destLat={dest?.lat} destLng={dest?.lng} lat={lastCoords?.lat} lng={lastCoords?.lng} />
+          </div>
+        )}
+
+        {gmapsUrl && (
+          <a style={{ ...styles.primaryBtn, background: TINTA, marginTop: 0 }} href={gmapsUrl} target="_blank" rel="noreferrer">
+            🧭 Abrir en Google Maps — Cómo llegar
+          </a>
+        )}
+
+        {!sharing ? (
+          <button style={{ ...styles.primaryBtn, marginTop: 10 }} onClick={startSharing}>Empezar a compartir mi ubicación</button>
+        ) : (
+          <>
+            <div style={{ ...styles.aliasBox, marginTop: 10, marginBottom: 10 }}>
+              Compartiendo ubicación en vivo{lastCoords ? ` · ${lastCoords.lat.toFixed(5)}, ${lastCoords.lng.toFixed(5)}` : "…"}
+            </div>
+            <button style={styles.secondaryBtn} onClick={stopSharing}>Dejar de compartir</button>
+          </>
+        )}
+        {errMsg && <div style={styles.errText}>{errMsg}</div>}
+        <p style={{ ...styles.emptyText, marginTop: 14 }}>
+          Dejá esta pestaña abierta mientras estás en camino — el cliente va a ver tu posición actualizarse sola.
+        </p>
       </div>
     </div>
   );
@@ -999,7 +1269,7 @@ const styles = {
 
   grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(220px,1fr))", gap: 16 },
   card: { background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 14, overflow: "hidden", display: "flex", flexDirection: "column" },
-  cardImg: { position: "relative", height: 160, display: "flex", alignItems: "center", justifyContent: "center", backgroundColor: "#F3ECDF" },
+  cardImg: { position: "relative", height: 110, display: "flex", alignItems: "center", justifyContent: "center" },
   cardEmoji: { fontSize: 40 },
   cardAddFab: { position: "absolute", right: 10, bottom: -14, width: 32, height: 32, borderRadius: "50%", background: TINTA, color: "#fff", border: "3px solid #fff", fontSize: 18, lineHeight: "24px", cursor: "pointer" },
   cardBody: { padding: "20px 14px 14px" },
