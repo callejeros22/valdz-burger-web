@@ -174,7 +174,12 @@ function rowToOrder(row) {
     createdAt: row.created_at, orderNumber: row.order_number || null,
     timestamps: row.timestamps || { Nuevo: row.created_at, "En preparación": null, Listo: null, "En camino": null, Entregado: null },
     courierLat: row.courier_lat ?? null, courierLng: row.courier_lng ?? null, courierUpdatedAt: row.courier_updated_at ?? null,
+    deliveryCode: row.delivery_code || null,
   };
+}
+
+function genDeliveryCode() {
+  return String(Math.floor(1000 + Math.random() * 9000));
 }
 
 async function getNextOrderNumber() {
@@ -203,7 +208,7 @@ async function insertOrder(order) {
     const { error } = await supabase.from("orders").insert({
       id: order.id, items: order.items, total: order.total,
       customer: order.customer, status: order.status, created_at: order.createdAt,
-      order_number: order.orderNumber, timestamps: order.timestamps,
+      order_number: order.orderNumber, timestamps: order.timestamps, delivery_code: order.deliveryCode,
     });
     if (error) console.error(error);
     return;
@@ -369,6 +374,20 @@ export default function ValdezBurger() {
   useEffect(() => { getProfile().then(setProfile); }, []);
   useEffect(() => { reloadItems(); }, [reloadItems]);
 
+  // Seguimiento persistente: si hay un pedido activo guardado (y no está
+  // ya en la vista del repartidor), lo retomamos automáticamente.
+  useEffect(() => {
+    if (urlParams.courier) return;
+    storageGet("active-order-id", false).then(async (id) => {
+      if (!id) return;
+      const o = await getOrderById(id);
+      if (!o) { storageSet("active-order-id", "", false); return; }
+      if (o.status === "Entregado") { storageSet("active-order-id", "", false); return; }
+      setLastOrder(o);
+      setView("confirm");
+    });
+  }, [urlParams.courier]);
+
   const sections = useMemo(() => groupItems(items), [items]);
 
   const flashToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 1600); };
@@ -405,6 +424,9 @@ export default function ValdezBurger() {
           activeCat={activeCat}
           setActiveCat={setActiveCat}
           onAdd={addToCart}
+          cartCount={cartCount}
+          cartTotal={total}
+          onCart={() => setView("cart")}
         />
       )}
 
@@ -443,10 +465,12 @@ export default function ValdezBurger() {
               customer: custom,
               status: "Nuevo",
               createdAt: now,
-              timestamps: { Nuevo: now, "En preparación": null, Listo: null, Entregado: null },
+              timestamps: { Nuevo: now, "En preparación": null, Listo: null, "En camino": null, Entregado: null },
+              deliveryCode: genDeliveryCode(),
             };
             await insertOrder(order);
             await saveProfile(custom);
+            await storageSet("active-order-id", order.id, false);
             setProfile(custom);
             setLastOrder(order);
             setCart([]);
@@ -455,7 +479,15 @@ export default function ValdezBurger() {
         />
       )}
 
-      {view === "confirm" && lastOrder && <Confirmation order={lastOrder} onNew={() => setView("store")} />}
+      {view === "confirm" && lastOrder && (
+        <Confirmation
+          order={lastOrder}
+          onNew={() => {
+            storageSet("active-order-id", "", false);
+            setView("store");
+          }}
+        />
+      )}
 
       {view === "courier-share" && urlParams.courier && (
         <CourierShare orderId={urlParams.courier} />
@@ -515,7 +547,7 @@ function TopBar({ query, setQuery, cartCount, onCart }) {
 }
 
 /* ---------------------------- STORE ---------------------------- */
-function Store({ query, sections, activeCat, setActiveCat, onAdd }) {
+function Store({ query, sections, activeCat, setActiveCat, onAdd, cartCount, cartTotal, onCart }) {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return sections.map((section) => ({
@@ -579,6 +611,13 @@ function Store({ query, sections, activeCat, setActiveCat, onAdd }) {
 
       {sections.length > 0 && filtered.every((s) => s.items.length === 0) && (
         <p style={styles.emptyText}>No encontramos nada con “{query}”.</p>
+      )}
+
+      {cartCount > 0 && (
+        <button style={styles.floatingCartBar} onClick={onCart}>
+          <span>🛒 {cartCount} {cartCount === 1 ? "producto" : "productos"}</span>
+          <span>{money(cartTotal)} · Ver pedido ›</span>
+        </button>
       )}
     </div>
   );
@@ -740,7 +779,10 @@ function Confirmation({ order, onNew }) {
     const t = setInterval(async () => {
       const list = await getOrders();
       const fresh = list.find((o) => o.id === order.id);
-      if (fresh) setLive(fresh);
+      if (fresh) {
+        setLive(fresh);
+        if (fresh.status === "Entregado") storageSet("active-order-id", "", false);
+      }
     }, 5000);
     return () => clearInterval(t);
   }, [order.id]);
@@ -784,6 +826,14 @@ function Confirmation({ order, onNew }) {
 
         {live.status === "En camino" && (
           <div style={{ marginBottom: 14 }}>
+            {live.deliveryCode && (
+              <div style={{ ...styles.aliasBox, textAlign: "center", marginBottom: 10 }}>
+                Cuando llegue el repartidor, dale este código para confirmar la entrega:
+                <div style={{ fontSize: 28, fontWeight: 800, letterSpacing: 4, color: BRASA, marginTop: 4 }}>
+                  {live.deliveryCode}
+                </div>
+              </div>
+            )}
             <CourierMapView lat={live.courierLat} lng={live.courierLng} />
           </div>
         )}
@@ -1172,6 +1222,9 @@ function CourierShare({ orderId }) {
   const [sharing, setSharing] = useState(false);
   const [errMsg, setErrMsg] = useState("");
   const [lastCoords, setLastCoords] = useState(null);
+  const [codeInput, setCodeInput] = useState("");
+  const [codeErr, setCodeErr] = useState("");
+  const [delivered, setDelivered] = useState(false);
   const watchIdRef = useRef(null);
   const lastSentRef = useRef(0);
 
@@ -1179,6 +1232,7 @@ function CourierShare({ orderId }) {
     getOrderById(orderId).then((o) => {
       setOrder(o);
       if (o) {
+        if (o.status === "Entregado") setDelivered(true);
         geocodeAddress(o.customer.address).then((coords) => {
           if (coords) { setDest(coords); setGeoStatus("ok"); }
           else setGeoStatus("failed");
@@ -1217,6 +1271,20 @@ function CourierShare({ orderId }) {
 
   useEffect(() => () => { if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current); }, []);
 
+  const confirmDelivery = async () => {
+    if (!order) return;
+    if (codeInput.trim() !== order.deliveryCode) {
+      setCodeErr("El código no coincide. Confirmalo con el cliente.");
+      return;
+    }
+    setCodeErr("");
+    const now = new Date().toISOString();
+    const timestamps = { ...order.timestamps, Entregado: now };
+    await updateOrderStatus(order.id, "Entregado", timestamps);
+    stopSharing();
+    setDelivered(true);
+  };
+
   const gmapsUrl = order
     ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(order.customer.address)}`
     : null;
@@ -1226,44 +1294,68 @@ function CourierShare({ orderId }) {
       <div style={styles.card2}>
         <h2 style={styles.panelHeading}>Reparto — Pedido #{order?.orderNumber || orderId}</h2>
         {!order && <p style={styles.emptyText}>Cargando datos del pedido…</p>}
-        {order && (
-          <div style={{ fontSize: 13, marginBottom: 14, lineHeight: 1.6 }}>
-            <div><b>{order.customer.name}</b> · {order.customer.phone}</div>
-            <div>{order.customer.address}</div>
-            {order.customer.notes && <div>Nota: {order.customer.notes}</div>}
-          </div>
-        )}
 
-        {order && (
-          <div style={{ marginBottom: 14 }}>
-            {geoStatus === "loading" && <p style={styles.emptyText}>Ubicando la dirección de entrega…</p>}
-            {geoStatus === "failed" && (
-              <p style={styles.emptyText}>No pudimos ubicar la dirección automáticamente en el mapa, pero podés usar el botón de abajo para navegar igual.</p>
-            )}
-            <CourierNavMap destLat={dest?.lat} destLng={dest?.lng} lat={lastCoords?.lat} lng={lastCoords?.lng} />
-          </div>
-        )}
-
-        {gmapsUrl && (
-          <a style={{ ...styles.primaryBtn, background: TINTA, marginTop: 0 }} href={gmapsUrl} target="_blank" rel="noreferrer">
-            🧭 Abrir en Google Maps — Cómo llegar
-          </a>
-        )}
-
-        {!sharing ? (
-          <button style={{ ...styles.primaryBtn, marginTop: 10 }} onClick={startSharing}>Empezar a compartir mi ubicación</button>
-        ) : (
+        {order && delivered ? (
           <>
-            <div style={{ ...styles.aliasBox, marginTop: 10, marginBottom: 10 }}>
-              Compartiendo ubicación en vivo{lastCoords ? ` · ${lastCoords.lat.toFixed(5)}, ${lastCoords.lng.toFixed(5)}` : "…"}
+            <div style={styles.confirmBadge}>✓</div>
+            <p style={styles.emptyText}>Pedido marcado como entregado. ¡Gracias!</p>
+          </>
+        ) : order && (
+          <>
+            <div style={{ fontSize: 13, marginBottom: 14, lineHeight: 1.6 }}>
+              <div><b>{order.customer.name}</b> · {order.customer.phone}</div>
+              <div>{order.customer.address}</div>
+              {order.customer.notes && <div>Nota: {order.customer.notes}</div>}
             </div>
-            <button style={styles.secondaryBtn} onClick={stopSharing}>Dejar de compartir</button>
+
+            <div style={{ marginBottom: 14 }}>
+              {geoStatus === "loading" && <p style={styles.emptyText}>Ubicando la dirección de entrega…</p>}
+              {geoStatus === "failed" && (
+                <p style={styles.emptyText}>No pudimos ubicar la dirección automáticamente en el mapa, pero podés usar el botón de abajo para navegar igual.</p>
+              )}
+              <CourierNavMap destLat={dest?.lat} destLng={dest?.lng} lat={lastCoords?.lat} lng={lastCoords?.lng} />
+            </div>
+
+            {gmapsUrl && (
+              <a style={{ ...styles.primaryBtn, background: TINTA, marginTop: 0 }} href={gmapsUrl} target="_blank" rel="noreferrer">
+                🧭 Abrir en Google Maps — Cómo llegar
+              </a>
+            )}
+
+            {!sharing ? (
+              <button style={{ ...styles.primaryBtn, marginTop: 10 }} onClick={startSharing}>Empezar a compartir mi ubicación</button>
+            ) : (
+              <>
+                <div style={{ ...styles.aliasBox, marginTop: 10, marginBottom: 10 }}>
+                  Compartiendo ubicación en vivo{lastCoords ? ` · ${lastCoords.lat.toFixed(5)}, ${lastCoords.lng.toFixed(5)}` : "…"}
+                </div>
+                <button style={styles.secondaryBtn} onClick={stopSharing}>Dejar de compartir</button>
+              </>
+            )}
+            {errMsg && <div style={styles.errText}>{errMsg}</div>}
+
+            <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px dashed ${BORDER}` }}>
+              <div style={styles.fieldLabel}>Confirmar entrega</div>
+              <p style={{ ...styles.emptyText, marginBottom: 8 }}>Pedile al cliente el código de 4 dígitos y ponelo acá:</p>
+              <input
+                style={{ ...styles.input, textAlign: "center", fontSize: 20, letterSpacing: 4 }}
+                value={codeInput}
+                maxLength={4}
+                inputMode="numeric"
+                placeholder="0000"
+                onChange={(e) => setCodeInput(e.target.value.replace(/[^0-9]/g, ""))}
+              />
+              {codeErr && <div style={styles.errText}>{codeErr}</div>}
+              <button style={{ ...styles.primaryBtn, background: "#2F8B57" }} onClick={confirmDelivery}>
+                Confirmar entrega
+              </button>
+            </div>
+
+            <p style={{ ...styles.emptyText, marginTop: 14 }}>
+              Dejá esta pestaña abierta mientras estás en camino — el cliente va a ver tu posición actualizarse sola.
+            </p>
           </>
         )}
-        {errMsg && <div style={styles.errText}>{errMsg}</div>}
-        <p style={{ ...styles.emptyText, marginTop: 14 }}>
-          Dejá esta pestaña abierta mientras estás en camino — el cliente va a ver tu posición actualizarse sola.
-        </p>
       </div>
     </div>
   );
@@ -1306,6 +1398,7 @@ const styles = {
   cartBtn: { background: BRASA, color: "#fff", border: "none", borderRadius: 20, padding: "9px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer", position: "relative", whiteSpace: "nowrap" },
   cartBadge: { background: "#fff", color: BRASA, fontSize: 11, borderRadius: "50%", padding: "1px 6px", marginLeft: 6, fontWeight: 800 },
   storeWrap: { maxWidth: 1100, margin: "0 auto", padding: "0 20px" },
+  floatingCartBar: { position: "fixed", left: "50%", transform: "translateX(-50%)", bottom: 16, maxWidth: 480, width: "calc(100% - 32px)", background: TINTA, color: "#fff", border: "none", borderRadius: 14, padding: "14px 18px", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13.5, fontWeight: 700, cursor: "pointer", boxShadow: "0 8px 24px rgba(0,0,0,0.25)", zIndex: 30 },
   hero: { padding: "28px 2px 6px" },
   heroEyebrow: { color: BRASA, fontSize: 12, fontWeight: 700, letterSpacing: 2 },
   heroTitle: { fontFamily: "'Anton', sans-serif", fontSize: 30, margin: "6px 0 4px", letterSpacing: 0.3 },
