@@ -527,7 +527,7 @@ function TopBar({ query, setQuery, cartCount, onCart }) {
       <div style={styles.topBarInner}>
         <div style={styles.brand}>
           <span style={styles.brandMark}>VZ</span>
-          <span style={styles.brandName}>VALD'Z BURGER</span>
+          <span style={styles.brandName}>VALD'Z BURGERS</span>
         </div>
         <div style={styles.searchWrap}>
           <span style={styles.searchIcon}>⌕</span>
@@ -1043,7 +1043,7 @@ function Kitchen({ onExit }) {
         </div>
       )}
       <div style={styles.kitchenHeader}>
-        <span style={styles.brandName}>COCINA · VALD'Z BURGER</span>
+        <span style={styles.brandName}>COCINA · VALD'Z BURGERS</span>
         <button style={styles.backLink} onClick={onExit}>Salir</button>
       </div>
 
@@ -1111,7 +1111,7 @@ function PrintArea({ order, type }) {
   return (
     <div id="print-area">
       <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, width: 280 }}>
-        <div style={{ textAlign: "center", fontWeight: 700 }}>VALD'Z BURGER</div>
+        <div style={{ textAlign: "center", fontWeight: 700 }}>VALD'Z BURGERS</div>
         <div style={{ textAlign: "center", fontSize: 11 }}>
           {type === "cocina" ? "COMANDA DE COCINA" : "FACTURA / COMPROBANTE"}
         </div>
